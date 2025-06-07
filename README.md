@@ -76,11 +76,13 @@ See [Evaluation.md](https://github.com/haotian-liu/LLaVA/blob/main/docs/Evaluati
 
 If you find MoVE-KD useful for your research and applications, please cite using this BibTeX:
 ```bibtex
-@article{cao2025move,
-  title={MoVE-KD: Knowledge Distillation for VLMs with Mixture of Visual Encoders},
-  author={Cao, Jiajun and Zhang, Yuan and Huang, Tao and Lu, Ming and Zhang, Qizhe and An, Ruichuan and Ma, Ningning and Zhang, Shanghang},
-  journal={arXiv preprint arXiv:2501.01709},
-  year={2025}
+@InProceedings{Cao_2025_CVPR,
+    author    = {Cao, Jiajun and Zhang, Yuan and Huang, Tao and Lu, Ming and Zhang, Qizhe and An, Ruichuan and Ma, Ningning and Zhang, Shanghang},
+    title     = {MoVE-KD: Knowledge Distillation for VLMs with Mixture of Visual Encoders},
+    booktitle = {Proceedings of the Computer Vision and Pattern Recognition Conference (CVPR)},
+    month     = {June},
+    year      = {2025},
+    pages     = {19846-19856}
 }
 
 ```
