@@ -234,7 +234,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
             #     else:
             #         torch.save(weight_to_save, os.path.join(output_dir, f'encoder.bin'))
 
-            keys_to_match = ['moe_down', 'moe_up', 'router']
+            keys_to_match = ['moe_down', 'moe_up', 'shared_down', 'shared_up', 'router']
             weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
             if trainer.args.local_rank == 0 or trainer.args.local_rank == -1:
                 if current_folder.startswith('checkpoint-'):
@@ -1023,10 +1023,19 @@ def train(attn_implementation=None):
             model.load_state_dict(model_dict)
 
        
-        tune_components = ['moe_down', 'moe_up', 'router']
-        for name, param in model.get_model().get_vision_tower().named_parameters():
-            if any(component in name for component in tune_components):
-                param.requires_grad = training_args.tune_encoder
+        tune_components = ['moe_down', 'moe_up', 'shared_down', 'shared_up', 'router']
+        if not training_args.finetune:
+            model.requires_grad_(False)
+            for name, param in model.get_model().get_vision_tower().named_parameters():
+                if any(component in name for component in tune_components):
+                    param.requires_grad = training_args.tune_encoder
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = training_args.tune_mm_mlp_adapter
+        else:
+            for name, param in model.get_model().get_vision_tower().named_parameters():
+                if any(component in name for component in tune_components):
+                    param.requires_grad = training_args.tune_encoder
+
         for name, param in model.named_parameters():
             if 'encoder_adapter' in name:
                 param.requires_grad = training_args.tune_encoder_adapter

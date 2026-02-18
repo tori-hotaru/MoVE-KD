@@ -80,6 +80,24 @@ class MoE_LoRA_CLIP(nn.Module):
                 ))
         
         self.router = nn.Linear(in_features, self.num_experts)
+        self.shared_down = LoRALayer(
+            in_channel=in_features,
+            out_channel=out_features,
+            rank=self.lora_rank,
+            lora_dropout_p=0.05,
+            lora_alpha=self.lora_alpha
+        )
+        self.shared_up = LoRALayer(
+            in_channel=out_features,
+            out_channel=in_features,
+            rank=self.lora_rank,
+            lora_dropout_p=0.05,
+            lora_alpha=self.lora_alpha
+        )
+
+        self.forward_mode = "router"
+        self.forced_expert_idx = None
+        self.router_train_only = False
 
     def forward_lora_moe(self, x, original_proj, routing, moe):
         original_out = original_proj(x)
@@ -107,23 +125,72 @@ class MoE_LoRA_CLIP(nn.Module):
 
 
     def forward(self, x):
+        if self.forward_mode == "forced_expert":
+            if self.forced_expert_idx is None:
+                raise ValueError("forced_expert mode requires forced_expert_idx")
+            down_moe_out = self.original_module.fc1(x) + self.moe_down[self.forced_expert_idx](x)
+            x = self.original_module.activation_fn(down_moe_out)
+            x = self.original_module.fc2(x) + self.moe_up[self.forced_expert_idx](x)
+            x = x + self.shared_up(self.original_module.activation_fn(self.shared_down(x)))
+            dummy_routing = torch.zeros((*x.shape[:2], self.num_experts), device=x.device, dtype=x.dtype)
+            dummy_routing[..., self.forced_expert_idx] = 1.0
+            return x, (dummy_routing, dummy_routing)
+
+        if self.forward_mode == "shared_only":
+            down_moe_out = self.original_module.fc1(x)
+            x = self.original_module.activation_fn(down_moe_out)
+            x = self.original_module.fc2(x)
+            x = x + self.shared_up(self.original_module.activation_fn(self.shared_down(x)))
+            dummy_routing = torch.zeros((*x.shape[:2], self.num_experts), device=x.device, dtype=x.dtype)
+            return x, (dummy_routing, dummy_routing)
+
         logits = self.router(x)
         routing = F.softmax(logits, dim=-1)
         index = routing.max(-1, keepdim=True)[1]
         y_hard = torch.zeros_like(logits, memory_format=torch.legacy_contiguous_format).scatter_(-1, index, 1.0)
         expert_choice = y_hard - routing.detach() + routing
 
-        if self.dense_moe:
+        if self.router_train_only:
+            if self.dense_moe:
+                down_moe_out = self.original_module.fc1(x)
+                lora_out_per_expert = [expert(x).detach() for expert in self.moe_down]
+                lora_out = torch.stack(lora_out_per_expert, 2)
+                down_moe_out = down_moe_out + (lora_out * routing[:, :, :, None]).sum(2)
+            else:
+                down_moe_out = self.original_module.fc1(x)
+                lora_out = torch.zeros_like(down_moe_out)
+                for i in range(self.num_experts):
+                    id1, id2, _ = torch.where(index == i)
+                    lora_out[id1, id2] = self.moe_down[i](x[id1, id2]).detach()
+                down_moe_out = down_moe_out + lora_out
+        elif self.dense_moe:
             down_moe_out = self.forward_lora_moe(x, self.original_module.fc1, routing, self.moe_down)
         else:
             down_moe_out = self.forward_lora_moe_sparse(x, self.original_module.fc1, index, self.moe_down)
 
         x = self.original_module.activation_fn(down_moe_out)
         
-        if self.dense_moe:
+        if self.router_train_only:
+            if self.dense_moe:
+                base = self.original_module.fc2(x)
+                lora_out_per_expert = [expert(x).detach() for expert in self.moe_up]
+                lora_out = torch.stack(lora_out_per_expert, 2)
+                x = base + (lora_out * routing[:, :, :, None]).sum(2)
+            else:
+                base = self.original_module.fc2(x)
+                lora_out = torch.zeros_like(base)
+                for i in range(self.num_experts):
+                    id1, id2, _ = torch.where(index == i)
+                    lora_out[id1, id2] = self.moe_up[i](x[id1, id2]).detach()
+                x = base + lora_out
+        elif self.dense_moe:
             x = self.forward_lora_moe(x, self.original_module.fc2, routing, self.moe_up)
         else:
             x = self.forward_lora_moe_sparse(x, self.original_module.fc2, index, self.moe_up)
+        shared_out = self.shared_up(self.original_module.activation_fn(self.shared_down(x)))
+        if self.forward_mode == "router_no_shared_grad":
+            shared_out = shared_out.detach()
+        x = x + shared_out
         return x, (routing, expert_choice)
 
 class MoECLIPEncoderLayer(CLIPEncoderLayer):
@@ -274,4 +341,3 @@ class MoECLIPVisionTransformer(CLIPVisionTransformer):
             attentions=encoder_outputs.attentions,
             routings= encoder_outputs.routings
         )
-

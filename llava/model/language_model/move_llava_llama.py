@@ -176,6 +176,115 @@ class MoVELlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                                             return_tensors='pt')['pixel_values'][0]
                                             for i in range(len(images))], dim=0)
        return image_processed.to(self.model.dtype)
+
+    def _iter_moe_layers(self):
+        if not self.config.moe['moe_encoder']:
+            return []
+        layers = self.model.get_vision_tower().vision_tower.vision_model.encoder.layers
+        return [layer.mlp for layer in layers if isinstance(layer.mlp, MoE_LoRA_CLIP)]
+
+    def _set_moe_forward_mode(self, mode="router", forced_expert_idx=None, router_train_only=False):
+        for moe_mlp in self._iter_moe_layers():
+            moe_mlp.forward_mode = mode
+            moe_mlp.forced_expert_idx = forced_expert_idx
+            moe_mlp.router_train_only = router_train_only
+
+    def _compute_teacher_tokens(self, images):
+        teacher_tokens = {}
+        teacher_weight = {}
+        token_weight = None
+        cls_token = None
+        for name, vision_teacher in self.vision_teachers.items():
+            with torch.no_grad():
+                vision_teacher.eval()
+                image_processor = vision_teacher.image_processor
+                image_processed = self.process_images(images, image_processor)
+                if name == 'CLIP':
+                    token, teacher_out = vision_teacher(image_processed)
+                    attentions = teacher_out.attentions[self.model_args.mm_vision_select_layer].mean(1)
+                    token_weight = torch.softmax(attentions[:, 0, 1:], dim=-1)
+                    cls_token = teacher_out.hidden_states[self.model_args.mm_vision_select_layer][:, 0, :]
+                else:
+                    token = vision_teacher(image_processed)
+                if isinstance(token, tuple):
+                    token = token[0]
+
+            if name == 'SAM':
+                token = token.view(token.size(0), token.size(1), -1).permute(0, 2, 1)
+                token = self.sam_adapter_2(self.gelu(self.sam_adapter_1(token).permute(0, 2, 1))).permute(0, 2, 1)
+            elif name == 'EVA':
+                token = token.view(token.size(0), token.size(1), -1).permute(0, 2, 1)
+                token = self.eva_adapter_2(self.gelu(self.eva_adapter_1(token).permute(0, 2, 1))).permute(0, 2, 1)
+            elif name == 'Pix2Struct':
+                token = token.view(token.size(0), token.size(1), -1).permute(0, 2, 1)
+                token = self.pix2struct_adapter_2(self.gelu(self.pix2struct_adapter_1(token).permute(0, 2, 1))).permute(0, 2, 1)
+            elif name == 'ConvNeXt':
+                token = self.convnext_adapter_2(self.gelu(self.convnext_adapter_1(token).permute(0, 2, 1))).permute(0, 2, 1)
+
+            teacher_tokens[name] = token
+            if cls_token is not None:
+                m_v_t = cls_token[:, None, :] @ token.transpose(1, 2)
+                teacher_weight[name] = m_v_t.mean(dim=(1, 2))
+
+        return teacher_tokens, teacher_weight, token_weight
+
+    def _compute_kd_loss(self, student_token, teacher_tokens, token_weight=None, force_teachers=None):
+        loss_kd = nn.MSELoss(reduction='none')
+        teacher_names = self.teachers_list if force_teachers is None else force_teachers
+        losses = [loss_kd(student_token, teacher_tokens[name]) for name in teacher_names]
+        losses = torch.stack(losses, dim=-1).mean(dim=2)
+        if self.training_args.token_weight and token_weight is not None:
+            weighted = (losses * token_weight.unsqueeze(-1)).sum(dim=1)
+            losses = losses.mean(dim=1) + weighted
+        else:
+            losses = losses.mean(dim=1)
+        return losses.mean()
+
+    def _forward_single_branch(
+        self,
+        input_ids,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        labels,
+        images,
+        image_sizes,
+        use_cache,
+        output_attentions,
+        output_hidden_states,
+        return_dict,
+    ):
+        (
+            branch_input_ids,
+            branch_position_ids,
+            branch_attention_mask,
+            branch_past_key_values,
+            branch_inputs_embeds,
+            branch_labels,
+            branch_vision_tower_output,
+        ) = self.prepare_inputs_labels_for_multimodal(
+            input_ids,
+            position_ids,
+            attention_mask,
+            past_key_values,
+            labels,
+            images,
+            image_sizes,
+        )
+
+        branch_outputs = super().forward(
+            input_ids=branch_input_ids,
+            attention_mask=branch_attention_mask,
+            position_ids=branch_position_ids,
+            past_key_values=branch_past_key_values,
+            inputs_embeds=branch_inputs_embeds,
+            labels=branch_labels,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+        return branch_outputs, branch_vision_tower_output
     
     def forward(
         self,
@@ -192,6 +301,12 @@ class MoVELlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        raw_input_ids = input_ids
+        raw_attention_mask = attention_mask
+        raw_position_ids = position_ids
+        raw_past_key_values = past_key_values
+        raw_labels = labels
+
         if inputs_embeds is None:
             if self.config.kd['kd_mode'] and not self.generate_mode:
                 images_processed = self.process_images(images,self.image_process)
@@ -231,6 +346,54 @@ class MoVELlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                     images,
                     image_sizes
                 )
+
+        if self.training_args.finetune and not self.generate_mode and self.config.kd['kd_mode'] and self.vision_teachers is not None:
+            teacher_tokens, _, token_weight = self._compute_teacher_tokens(images)
+
+            self._set_moe_forward_mode(mode="router_no_shared_grad", router_train_only=False)
+            outputs_router, vision_router = self._forward_single_branch(
+                raw_input_ids,
+                raw_attention_mask,
+                raw_position_ids,
+                raw_past_key_values,
+                raw_labels,
+                images_processed,
+                image_sizes,
+                use_cache,
+                output_attentions,
+                output_hidden_states,
+                return_dict,
+            )
+            student_router = vision_router.hidden_states[self.model_args.mm_vision_select_layer][:, 1:, :]
+            global_kd_loss = self._compute_kd_loss(student_router, teacher_tokens, token_weight)
+
+            self._set_moe_forward_mode(mode="shared_only", router_train_only=False)
+            outputs_shared, vision_shared = self._forward_single_branch(
+                raw_input_ids,
+                raw_attention_mask,
+                raw_position_ids,
+                raw_past_key_values,
+                raw_labels,
+                images_processed,
+                image_sizes,
+                use_cache,
+                output_attentions,
+                output_hidden_states,
+                return_dict,
+            )
+            student_shared = vision_shared.hidden_states[self.model_args.mm_vision_select_layer][:, 1:, :]
+            clip_only_loss = self._compute_kd_loss(student_shared, teacher_tokens, token_weight, force_teachers=['CLIP'])
+
+            self._set_moe_forward_mode(mode="router", router_train_only=False)
+            total_loss = (outputs_router.loss + global_kd_loss) + (outputs_shared.loss + clip_only_loss)
+
+            return CausalLMOutputWithPast(
+                loss=total_loss,
+                logits=outputs_router.logits,
+                past_key_values=outputs_router.past_key_values,
+                hidden_states=outputs_router.hidden_states,
+                attentions=outputs_router.attentions,
+            )
         
         if self.generate_mode or not self.config.kd['kd_mode']:
             return super().forward(
@@ -276,106 +439,30 @@ class MoVELlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             loss = loss + balancing_loss * self.training_args.moe_encoder_balance_w
     
         torch.cuda.empty_cache()
-        flag = False 
+        kd_loss = 0.0
         if self.vision_teachers is not None and self.config.kd['kd_mode']:
+            teacher_tokens, _, token_weight = self._compute_teacher_tokens(images)
+            student_token = vision_tower_output.hidden_states[self.model_args.mm_vision_select_layer][:, 1:, :]
 
-            kd_loss = 0.0
-            loss_kd = nn.MSELoss(reduction='none')
-
-            image_embeddings = vision_tower_output.hidden_states[self.model_args.mm_vision_select_layer] 
-            v_token = image_embeddings[:,1:,:]
-            
-            teacher_weight=[]                     
-            teacher_loss=[]
-
-
-            for name, vision_teacher in self.vision_teachers.items():
-                with torch.no_grad():
-                    vision_teacher.eval()
-                    image_processor = vision_teacher.image_processor
-                    image_processed = self.process_images(images,image_processor)
-                    if name == 'CLIP':
-                        token,vision_tower_output = vision_teacher(image_processed)
-                        attentions = vision_tower_output.attentions[self.model_args.mm_vision_select_layer] #[b,16,577,577]
-                        attentions = attentions.mean(1)
-                        token_weight = torch.softmax(attentions[:,0,1:], dim=-1) #[b,576]
-                        embeddings = vision_tower_output.hidden_states[self.model_args.mm_vision_select_layer] # (b, 577, 1024)
-                        cls_token = embeddings[:,0,:]
-                    else:
-                        token = vision_teacher(image_processed) 
-                    if isinstance(token, tuple):
-                        token = token[0]
-                
-                if name == 'CLIP':
-                    clip_token = token
-                    teacher_loss.append(loss_kd(v_token, clip_token)) # [b, 576, 1024]
-                    m_v_t = cls_token[:, None, :] @ clip_token.transpose(1, 2)  # [b, 1, 1024]
-                    teacher_weight.append(m_v_t.mean(dim=(1, 2))) # [b]
-                elif name == 'SAM':
-                    sam_token = token.view(token.size(0), token.size(1), -1).permute(0, 2, 1) # (b, 4096, 256)
-                    sam_token  = self.sam_adapter_2(self.gelu(self.sam_adapter_1(sam_token).permute(0,2,1))).permute(0,2,1)
-                    teacher_loss.append(loss_kd(v_token, sam_token)) 
-                    m_v_t = cls_token[:, None, :] @ sam_token.transpose(1, 2)  # [b, 1, 1024]
-                    teacher_weight.append(m_v_t.mean(dim=(1, 2))) # [b]
-                elif name == 'EVA':
-                    eva_token = token.view(token.size(0), token.size(1), -1).permute(0, 2, 1)
-                    eva_token = self.eva_adapter_2(self.gelu(self.eva_adapter_1(eva_token).permute(0,2,1))).permute(0,2,1)
-                    teacher_loss.append(loss_kd(v_token, eva_token))
-                    m_v_t = cls_token[:, None, :] @ eva_token.transpose(1, 2)  # [b, 1, 1024]
-                    teacher_weight.append(m_v_t.mean(dim=(1, 2))) # [b]
-                elif name == 'Pix2Struct':
-                    pix2struct_token = token.view(token.size(0), token.size(1), -1).permute(0, 2, 1)
-                    pix2struct_token  = self.pix2struct_adapter_2(self.gelu(self.pix2struct_adapter_1(pix2struct_token).permute(0,2,1))).permute(0,2,1)
-                    teacher_loss.append(loss_kd(v_token, pix2struct_token))
-                    m_v_t = cls_token[:, None, :] @ pix2struct_token.transpose(1, 2)  # [b, 1, 1024]
-                    teacher_weight.append(m_v_t.mean(dim=(1, 2))) # [b]
-                elif name == 'ConvNeXt':
-                    convnext_token = token # (b, 1024, 3072)
-                    convnext_token  = self.convnext_adapter_2(self.gelu(self.convnext_adapter_1(convnext_token).permute(0,2,1))).permute(0,2,1)
-                    teacher_loss.append(loss_kd(v_token, convnext_token))
-                    m_v_t = cls_token[:, None, :] @ convnext_token.transpose(1, 2)  # [b, 1, 1024]
-                    teacher_weight.append(m_v_t.mean(dim=(1, 2))) # [b]
-            
-            if flag:
-                return CausalLMOutputWithPast(
-                    loss=loss,
-                    logits=outputs.logits,
-                    past_key_values=outputs.past_key_values,
-                    hidden_states=outputs.hidden_states,
-                    attentions=outputs.attentions,
-                )
-
-            alpha = self.training_args.kd_memory_w
-            if self.training_args.teacher_weight:
-                teacher_weight = torch.stack(teacher_weight, dim=-1)
-                else_weight = torch.softmax(teacher_weight[:,1:], dim=-1).to(token.dtype).cuda()  # [b, num_teachers-1]
-                else_weight_ = else_weight.mean(0)
-                if else_weight_.max() > 0.8:
-                    bias = 0.2
-                    else_weight = torch.softmax(else_weight + bias, dim=-1)
-
-                clip_weight = torch.full((batch_size, 1 ), alpha).to(token.dtype).cuda()
-                teacher_weight = torch.cat((clip_weight, else_weight*(1-alpha)), dim=1) 
+            if self.training_args.finetune:
+                kd_loss = self._compute_kd_loss(student_token, teacher_tokens, token_weight)
+                clip_only_loss = self._compute_kd_loss(student_token, teacher_tokens, token_weight, force_teachers=['CLIP'])
+                loss = loss + kd_loss + clip_only_loss
             else:
-                clip_weight = torch.full((batch_size, 1 ), 1) * alpha
-                else_weight = torch.full((batch_size, self.num_teachers-1 ), 1) * ((1-alpha) / (self.num_teachers-1))
-                teacher_weight = torch.cat((clip_weight, else_weight), dim=1).to(token.dtype).cuda() # [b, num_teachers]
+                routed_losses = 0.0
+                routed_names = [name for name in self.teachers_list if name != 'CLIP']
+                for expert_idx, t_name in enumerate(routed_names):
+                    self._set_moe_forward_mode(mode="forced_expert", forced_expert_idx=expert_idx)
+                    routed_losses = routed_losses + self._compute_kd_loss(student_token, teacher_tokens, token_weight, force_teachers=[t_name])
 
-            teacher_loss = torch.stack(teacher_loss, dim=-1).mean(dim=2) # [b,v_t,num_teachers]
-            if self.training_args.token_weight:
-                teacher_loss_token = (teacher_loss * token_weight.unsqueeze(-1)).sum(dim=1)
-                teacher_loss = teacher_loss.mean(dim=1) + teacher_loss_token
-            else:
-                teacher_loss = teacher_loss.mean(dim=1)
-            
-            if self.training_args.teacher_weight:
-                kd_loss = (teacher_weight * teacher_loss).sum(dim=-1).mean()
-            else:
-                kd_loss = (teacher_weight * teacher_loss).sum(dim=-1).mean()
+                self._set_moe_forward_mode(mode="shared_only")
+                shared_kd = self._compute_kd_loss(student_token, teacher_tokens, token_weight, force_teachers=routed_names)
 
-        kd_loss = kd_loss * self.training_args.kd_w
-        teacher_loss = teacher_loss  * self.training_args.kd_w
-        loss = loss + kd_loss
+                self._set_moe_forward_mode(mode="router", router_train_only=True)
+                router_kd = self._compute_kd_loss(student_token, teacher_tokens, token_weight)
+                self._set_moe_forward_mode(mode="router", router_train_only=False)
+                kd_loss = (routed_losses + shared_kd + router_kd) * self.training_args.kd_w
+                loss = loss + kd_loss
        
         return CausalLMOutputWithPast(
             loss=loss,
